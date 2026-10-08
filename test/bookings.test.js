@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createBooking, listBookings, ValidationError } from '../src/bookings.js';
+import { BookingConflictError, createBooking, listBookings, ValidationError } from '../src/bookings.js';
 import { createStore } from '../src/store.js';
 
 const validBooking = {
@@ -57,6 +57,81 @@ test('accepts a real leap day and millisecond timestamps', () => {
     ...validBooking, startTime: '2032-02-29T09:00:00.125Z', endTime: '2032-02-29T10:00:00.125Z',
   });
   assert.equal(booking.startTime, '2032-02-29T09:00:00.125Z');
+});
+
+const overlapRejections = [
+  ['an exact-match interval', { startTime: '2030-06-12T09:00:00Z', endTime: '2030-06-12T10:00:00Z' }],
+  ['a partial overlap at the start', { startTime: '2030-06-12T08:30:00Z', endTime: '2030-06-12T09:30:00Z' }],
+  ['a partial overlap at the end', { startTime: '2030-06-12T09:30:00Z', endTime: '2030-06-12T10:30:00Z' }],
+  ['full containment of the existing booking', { startTime: '2030-06-12T08:00:00Z', endTime: '2030-06-12T11:00:00Z' }],
+  ['full containment within the existing booking', { startTime: '2030-06-12T09:15:00Z', endTime: '2030-06-12T09:45:00Z' }],
+];
+
+for (const [description, overrides] of overlapRejections) {
+  test(`rejects a new booking with ${description} in the same room`, () => {
+    const store = createStore();
+    createBooking(store, validBooking);
+    assert.throws(() => createBooking(store, { ...validBooking, ...overrides }), BookingConflictError);
+    assert.equal(store.bookings.length, 1);
+  });
+}
+
+test('allows a new booking that starts exactly when an existing booking in the same room ends', () => {
+  const store = createStore();
+  const first = createBooking(store, validBooking);
+  const next = createBooking(store, { ...validBooking, startTime: validBooking.endTime, endTime: '2030-06-12T11:00:00Z' });
+  assert.equal(store.bookings.length, 2);
+  assert.equal(next.startTime, first.endTime);
+});
+
+test('allows a new booking that ends exactly when an existing booking in the same room starts', () => {
+  const store = createStore();
+  const first = createBooking(store, validBooking);
+  const previous = createBooking(store, { ...validBooking, startTime: '2030-06-12T08:00:00Z', endTime: validBooking.startTime });
+  assert.equal(store.bookings.length, 2);
+  assert.equal(previous.endTime, first.startTime);
+});
+
+test('allows two different rooms to hold identical, overlapping bookings at the same time', () => {
+  const store = createStore();
+  createBooking(store, validBooking);
+  const other = createBooking(store, { ...validBooking, roomId: 'maple' });
+  assert.equal(store.bookings.length, 2);
+  assert.equal(other.roomId, 'maple');
+});
+
+test('rejects a same-room overlap against a multi-day booking regardless of the UI-selected date', () => {
+  const store = createStore();
+  createBooking(store, { ...validBooking, startTime: '2030-06-10T00:00:00Z', endTime: '2030-06-20T00:00:00Z' });
+  assert.throws(
+    () => createBooking(store, { ...validBooking, startTime: '2030-06-15T09:00:00Z', endTime: '2030-06-15T10:00:00Z' }),
+    BookingConflictError
+  );
+  assert.equal(store.bookings.length, 1);
+});
+
+test('the conflict message names the conflicting interval, organizer, and title', () => {
+  const store = createStore();
+  createBooking(store, validBooking);
+  try {
+    createBooking(store, validBooking);
+    assert.fail('expected BookingConflictError');
+  } catch (error) {
+    assert.ok(error instanceof BookingConflictError);
+    assert.equal(error.status, 409);
+    assert.ok(!(error instanceof ValidationError));
+    assert.match(error.message, /2030-06-12T09:00:00\.000Z/);
+    assert.match(error.message, /2030-06-12T10:00:00\.000Z/);
+    assert.match(error.message, new RegExp(validBooking.organizer));
+    assert.match(error.message, new RegExp(validBooking.title));
+  }
+});
+
+test('a malformed request that would also conflict fails validation before the overlap check runs', () => {
+  const store = createStore();
+  createBooking(store, validBooking);
+  assert.throws(() => createBooking(store, { ...validBooking, title: '' }), ValidationError);
+  assert.equal(store.bookings.length, 1);
 });
 
 const invalidInputs = [
