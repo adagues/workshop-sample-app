@@ -1,7 +1,22 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createBooking, listBookings, ValidationError } from '../src/bookings.js';
+import {
+  createBooking,
+  listBookings,
+  findConflictingBooking,
+  ValidationError,
+  BookingConflictError,
+} from '../src/bookings.js';
 import { createStore } from '../src/store.js';
+
+function captureError(fn) {
+  try {
+    fn();
+  } catch (error) {
+    return error;
+  }
+  throw new assert.AssertionError({ message: 'Expected function to throw' });
+}
 
 const validBooking = {
   roomId: 'cedar',
@@ -96,4 +111,91 @@ for (const date of [undefined, '', '2030-2-1', '2030-02-30', 'not-a-date']) {
 
 test('rejects an unknown room filter', () => {
   assert.throws(() => listBookings(createStore(), 'missing', '2030-06-12'), ValidationError);
+});
+
+test('rejects a booking that overlaps an existing one in the same room, naming the conflict', () => {
+  const store = createStore();
+  const existing = createBooking(store, validBooking);
+  const error = captureError(() =>
+    createBooking(store, { ...validBooking, title: 'New meeting', startTime: '2030-06-12T09:30:00Z', endTime: '2030-06-12T10:30:00Z' })
+  );
+  assert.ok(error instanceof BookingConflictError);
+  assert.deepEqual(error.conflict, {
+    roomId: existing.roomId,
+    startTime: existing.startTime,
+    endTime: existing.endTime,
+    organizer: existing.organizer,
+  });
+  assert.equal('title' in error.conflict, false);
+  assert.equal(store.bookings.length, 1);
+});
+
+test('allows a back-to-back booking starting exactly when the existing one ends', () => {
+  const store = createStore();
+  const existing = createBooking(store, validBooking);
+  const next = createBooking(store, { ...validBooking, startTime: existing.endTime, endTime: '2030-06-12T11:00:00Z' });
+  assert.equal(store.bookings.length, 2);
+  assert.equal(next.startTime, existing.endTime);
+});
+
+test('allows a different room to be booked for the identical time range', () => {
+  const store = createStore();
+  createBooking(store, validBooking);
+  const other = createBooking(store, { ...validBooking, roomId: 'maple' });
+  assert.equal(store.bookings.length, 2);
+  assert.equal(other.roomId, 'maple');
+});
+
+test('reports only the earliest-starting conflict when a request overlaps two existing bookings', () => {
+  const store = createStore();
+  const later = createBooking(store, { ...validBooking, startTime: '2030-06-12T10:00:00Z', endTime: '2030-06-12T10:30:00Z' });
+  const earlier = createBooking(store, { ...validBooking, startTime: '2030-06-12T09:00:00Z', endTime: '2030-06-12T09:20:00Z' });
+  const attempt = () =>
+    createBooking(store, { ...validBooking, title: 'New meeting', startTime: '2030-06-12T09:15:00Z', endTime: '2030-06-12T10:15:00Z' });
+  const first = captureError(attempt);
+  assert.ok(first instanceof BookingConflictError);
+  assert.equal(first.conflict.startTime, earlier.startTime);
+  const second = captureError(attempt);
+  assert.deepEqual(second.conflict, first.conflict);
+  assert.notEqual(first.conflict.startTime, later.startTime);
+});
+
+test('findConflictingBooking returns undefined when no booking overlaps', () => {
+  const store = createStore();
+  createBooking(store, validBooking);
+  assert.equal(
+    findConflictingBooking(store, 'cedar', '2030-06-12T11:00:00Z', '2030-06-12T12:00:00Z'),
+    undefined
+  );
+});
+
+test('findConflictingBooking returns the overlapping booking directly, independent of field validation', () => {
+  const store = createStore();
+  const existing = createBooking(store, validBooking);
+  const found = findConflictingBooking(store, 'cedar', '2030-06-12T09:30:00Z', '2030-06-12T10:30:00Z');
+  assert.equal(found.id, existing.id);
+});
+
+test('reports both a field-validation problem and a conflict when a request has both', () => {
+  const store = createStore();
+  const existing = createBooking(store, validBooking);
+  const error = captureError(() =>
+    createBooking(store, { ...validBooking, title: '  ', startTime: '2030-06-12T09:30:00Z', endTime: '2030-06-12T10:30:00Z' })
+  );
+  assert.ok(error instanceof ValidationError);
+  assert.match(error.message, /Title must contain/);
+  assert.deepEqual(error.conflict, {
+    roomId: existing.roomId,
+    startTime: existing.startTime,
+    endTime: existing.endTime,
+    organizer: existing.organizer,
+  });
+  assert.equal(store.bookings.length, 1);
+});
+
+test('reports only the field-validation problem when there is no conflict', () => {
+  const store = createStore();
+  const error = captureError(() => createBooking(store, { ...validBooking, title: '  ' }));
+  assert.ok(error instanceof ValidationError);
+  assert.equal(error.conflict, undefined);
 });
