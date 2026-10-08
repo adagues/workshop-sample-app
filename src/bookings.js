@@ -4,10 +4,43 @@ export class ValidationError extends Error {
   status = 400;
 }
 
+export class BookingConflictError extends Error {
+  constructor(conflict) {
+    super('This room is already booked for part of that time.');
+    this.conflict = conflict;
+  }
+}
+
 function requireRoom(store, roomId) {
   if (!store.rooms.some((room) => room.id === roomId)) {
     throw new ValidationError('Choose an existing room.');
   }
+}
+
+function validateField(input, field) {
+  if (typeof input[field] !== 'string' || !input[field].trim() || input[field].trim().length > 100) {
+    return new ValidationError(`${field === 'title' ? 'Title' : 'Organizer'} must contain 1–100 characters.`);
+  }
+  return undefined;
+}
+
+// Half-open [startTime, endTime) overlap, scoped to the same room; mirrors the
+// predicate listBookings already uses so the comparison exists in exactly one place.
+export function findConflictingBooking(store, roomId, startTime, endTime) {
+  const candidates = store.bookings.filter(
+    (booking) => booking.roomId === roomId && startTime < booking.endTime && endTime > booking.startTime
+  );
+  if (candidates.length === 0) return undefined;
+  return candidates.sort((a, b) => a.startTime.localeCompare(b.startTime))[0];
+}
+
+function toConflictDetails(booking) {
+  return {
+    roomId: booking.roomId,
+    startTime: booking.startTime,
+    endTime: booking.endTime,
+    organizer: booking.organizer,
+  };
 }
 
 function parseTimestamp(value) {
@@ -39,16 +72,26 @@ export function createBooking(store, input) {
     throw new ValidationError('Provide a booking object.');
   }
   requireRoom(store, input.roomId);
-  for (const field of ['title', 'organizer']) {
-    if (typeof input[field] !== 'string' || !input[field].trim() || input[field].trim().length > 100) {
-      throw new ValidationError(`${field === 'title' ? 'Title' : 'Organizer'} must contain 1–100 characters.`);
-    }
-  }
   const startTime = parseTimestamp(input.startTime);
   const endTime = parseTimestamp(input.endTime);
   if (startTime >= endTime) {
     throw new ValidationError('End time must be after start time.');
   }
+
+  // Field validation and conflict detection are independent outcomes of the same
+  // request; both are determined before anything is thrown so a response can
+  // report either or both (req-combined-validation-and-conflict-errors).
+  const fieldError = validateField(input, 'title') ?? validateField(input, 'organizer');
+  const conflict = findConflictingBooking(store, input.roomId, startTime, endTime);
+
+  if (fieldError) {
+    if (conflict) fieldError.conflict = toConflictDetails(conflict);
+    throw fieldError;
+  }
+  if (conflict) {
+    throw new BookingConflictError(toConflictDetails(conflict));
+  }
+
   const booking = {
     id: randomUUID(),
     roomId: input.roomId,
